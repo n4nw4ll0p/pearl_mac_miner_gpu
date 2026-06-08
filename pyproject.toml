@@ -1,0 +1,10 @@
+[project]
+name = "pearl-apple-miner"
+version = "1.0.0"
+description = "Pearl proof-of-work miner for Apple Silicon (MLX GPU + ARM SME), pool & solo."
+# The shipped kernel binaries are built for CPython 3.12 on arm64 macOS — pin accordingly.
+requires-python = ">=3.12,<3.13"
+dependencies = ["mlx>=0.31,<0.32", "numpy>=1.24", "blake3>=0.4", "bitcoin-utils>=0.7,<0.9"]
+
+[tool.setuptools]
+py-modules = []

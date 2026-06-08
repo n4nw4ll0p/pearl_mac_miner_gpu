@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.log
+
+# Local environments and credentials/configuration.
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+miner.config.json
+
+# Test, coverage, and packaging output.
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# macOS metadata.
+.DS_Store

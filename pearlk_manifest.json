@@ -1,0 +1,24 @@
+{
+  "kernels": [
+    "bound_digest",
+    "bound_mask",
+    "build_ab",
+    "build_ab_t",
+    "fold",
+    "fold_pair",
+    "noise",
+    "signal",
+    "transcripts_b",
+    "transcripts_p",
+    "transcripts_ref",
+    "transcripts_s",
+    "transcripts_s_2048_128_1024_16",
+    "transcripts_s_2048_128_1024_16_t",
+    "transcripts_s_2048_128_128_16",
+    "transcripts_s_2048_128_128_16_t",
+    "transcripts_s_2048_128_256_16",
+    "transcripts_s_2048_128_256_16_t",
+    "transcripts_s_2048_128_512_16",
+    "transcripts_s_2048_128_512_16_t"
+  ]
+}

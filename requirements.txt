@@ -1,0 +1,4 @@
+mlx>=0.31,<0.32   # _pearlk.so links MLX's C++ ABI (built against 0.31); newer minors may break loading
+numpy>=1.24
+blake3>=0.4
+bitcoin-utils>=0.7,<0.9   # import name: bitcoinutils; solo (--rpc) block assembly only

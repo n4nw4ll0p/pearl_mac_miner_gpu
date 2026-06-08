@@ -1,0 +1,22 @@
+Pearl Apple Miner — Compute Binary License
+Copyright (c) 2026. All rights reserved.
+
+This license applies only to these bundled compute artifacts:
+
+  _pearlk.cpython-312-darwin.so
+  libcpu_search.dylib
+  pearlk.metallib
+
+These artifacts are distributed only in compiled form. You may use and copy
+them, unmodified, as part of Pearl Apple Miner distributions. You may not
+modify, sell, sublicense, decompile, disassemble, reverse engineer, or use them
+to derive their source or a functionally equivalent implementation without
+written permission.
+
+The MIT License in LICENSE applies to the repository's source code, not to the
+three artifacts listed above. The pearl_mining extension is third-party
+software covered by the notice in THIRD_PARTY_NOTICES.
+
+THE ARTIFACTS ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
