@@ -68,7 +68,7 @@ if _MCPU_HOT % 32 != 0:   # the SME unified engine needs m%32==0; fall back to t
 TILE = 16
 ROWS = list(range(TILE))
 COLS = list(range(TILE))
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 
 def _u32x8_le(b: bytes) -> np.ndarray:
@@ -890,8 +890,9 @@ def main():
                     help="pool mode: stop after N accepted shares (0 = run forever).")
     ap.add_argument("--max-draws", type=int, default=0,
                     help="stop after searching N draws (0 = run forever); mainly for testing/benchmarks.")
-    ap.add_argument("--engine", choices=("gpu", "cpu", "both"), default="gpu",
-                    help="which engine(s) mine: gpu (MLX), cpu (SME), or both concurrently")
+    ap.add_argument("--engine", choices=("gpu", "cpu", "both"), default="both",
+                    help="which engine(s) mine: gpu (MLX), cpu (SME), or both concurrently "
+                         "(default: both; automatically falls back to gpu without ARM SME)")
     ap.add_argument("--compute-pct", type=int, default=100, dest="compute_pct",
                     help="%% of compute to use (1-100, default 100). <100 duty-cycles the engine for "
                          "background/low-heat mining: idles between bursts so the engine is busy ~N%% of "

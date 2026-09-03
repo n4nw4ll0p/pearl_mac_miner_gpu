@@ -41,28 +41,33 @@ proof locally.
 
 ## M4 Max benchmark
 
-Measured September 3, 2026 on an Apple M4 Max with a 14-core CPU, 32-core GPU,
-36 GB RAM, Python 3.12, and MLX 0.31.2. Results are the median of three 8-draw
-runs after warm-up at `--k 2048 --rank 128` and 100% compute.
+Recorded May 31–June 1, 2026 on an M4 Max at `--k 2048 --rank 128` and 100%
+compute. The peak run used the production pipeline, searched disjoint GPU and
+CPU nonce ranges, and passed the end-to-end self-test.
 
-| Engine | Draw size | Throughput |
-|---|---:|---:|
-| GPU | `m=16384` | **5.35 TH/s** |
-| CPU/SME | `m=16384` | **2.68 TH/s** |
-| GPU + CPU/SME | `m=16384`, `m-cpu=8192` | **5.53 TH/s** (4.42 + 1.10) |
+| Measurement | Throughput |
+|---|---:|
+| GPU, cold burst | **~5.3 TH/s** |
+| CPU/SME, unified engine | **3.53 TH/s** |
+| GPU + CPU/SME, sustained | **7.92 TH/s** |
+| GPU + CPU/SME, typical cool burst | **8.0–8.8 TH/s** |
+| GPU + CPU/SME, highest observed | **9.04 TH/s** |
 
-Short runs vary with temperature, power mode, and other system activity.
+The highest run was approximately 5.76 TH/s GPU plus 3.31 TH/s CPU/SME.
+Performance varies with temperature, power mode, and other system activity.
 
 ## Engines and tuning
 
-- `--engine {gpu,cpu,both}` selects the GPU, CPU/SME, or both.
+- `--engine {gpu,cpu,both}` selects the GPU, CPU/SME, or both. It defaults to
+  `both` on M4 and newer and automatically falls back to `gpu` on M1–M3.
 - `--m` sets the GPU draw size; `--m-cpu` sets the CPU size in `both` mode.
 - `--compute-pct N` reduces compute use and heat through duty-cycle throttling.
-- Defaults are tuned for an M4 Max: `--m 16384 --m-cpu 8192 --k 2048 --rank 128`.
+- M4 defaults match the peak configuration: `--engine both --m 16384
+  --m-cpu 8192 --k 2048 --rank 128 --compute-pct 100`.
 - See [KERNELS.md](KERNELS.md) to use replacement kernels.
 
-Thread counts can be tuned with `PEARL_SME_THREADS`, `PEARL_TR_THREADS`, and
-`PEARL_SETUP_THREADS` (all default to `8`, `8`, and `3`, respectively).
+The unified CPU engine defaults to 14 threads and six slots. Override them with
+`PEARL_U_TR` and `PEARL_U_SLOTS`.
 
 ## Developer fee
 
