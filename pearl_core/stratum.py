@@ -7,11 +7,11 @@ live pool traffic and is documented below.
 Two pool endpoints use this wire format:
 
   * **LuckyPool** (`mining.*`, object params).
-      authorize : ``mining.authorize {"wallet": "prl1p….worker"}``  -> ``{result:true}``
+      authorize : ``mining.authorize {wallet, worker, pass, agent}``  -> ``{result:true}``
       job       : server pushes ``mining.notify {header, height, job_id, target}``
       share     : ``mining.submit {"job_id", "plain_proof"}``  (base64 PlainProof)
   * **AlphaPool plain Stratum** (port 5571) uses the same object-param messages.
-      Its fixed difficulty is selected with authorize password ``x;d=N``.
+      Its fixed difficulty is selected with authorize ``pass`` value ``x;d=N``.
 
 AlphaPool's legacy port 5566 front-loads an anti-DDoS ``pearl.challenge`` PoW
 gate. We detect that older dialect and raise `AlphaPoolChallengeUnsupported`.
@@ -122,6 +122,7 @@ class StratumPoolClient:
         worker: Optional[str] = None,
         difficulty: Optional[int] = None,
         password: Optional[str] = None,
+        agent: str = "pearl-apple-miner",
         log: Callable[[str], None] = print,
         timeout: float = 30.0,
         keepalive_interval: float = 20.0,
@@ -130,12 +131,13 @@ class StratumPoolClient:
         self.wallet = wallet
         self.worker = worker
         self.difficulty = difficulty
-        # AlphaPool 5571 reads static difficulty from the standard password field;
-        # LuckyPool reads the numeric difficulty field. Sending both makes
-        # --difficulty portable while an explicit password can also carry t=<PRL>.
+        # The CLI calls this a password, but Pearl's named-parameter Stratum
+        # dialect calls the wire field `pass`. AlphaPool 5571 uses it for static
+        # difficulty and payout options.
         self.password = password if password is not None else (
             f"x;d={int(difficulty)}" if difficulty is not None else None
         )
+        self.agent = agent
         self.log = log
         self.timeout = timeout
         self.keepalive_interval = max(0.0, float(keepalive_interval))
@@ -279,11 +281,16 @@ class StratumPoolClient:
     def authorize(self) -> Any:
         """Send ``mining.authorize`` and wait for the ack. Raises
         `AlphaPoolChallengeUnsupported` if the server is challenge-gated."""
-        params: dict = {"wallet": self._login()}
-        if self.difficulty is not None:
-            params["difficulty"] = int(self.difficulty)
+        # Pearl's object-parameter Stratum dialect uses four stable fields. In
+        # particular, the option field is named `pass`, not `password`, and the
+        # worker is separate from the wallet. AlphaPool's 5571 bridge rejects
+        # the latter spelling/shape with the misleading "backend authorize
+        # failed" error. LuckyPool accepts this canonical shape as well.
+        params: dict = {"wallet": self.wallet, "agent": self.agent}
+        if self.worker:
+            params["worker"] = self.worker
         if self.password is not None:
-            params["password"] = self.password
+            params["pass"] = self.password
         result = self._request("mining.authorize", params, timeout=min(self.timeout, 12.0))
         self._authorized = True
         if self.keepalive_interval and not (

@@ -68,7 +68,7 @@ if _MCPU_HOT % 32 != 0:   # the SME unified engine needs m%32==0; fall back to t
 TILE = 16
 ROWS = list(range(TILE))
 COLS = list(range(TILE))
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 
 def _u32x8_le(b: bytes) -> np.ndarray:
@@ -366,7 +366,10 @@ def mine_pool(pool_url: str, address: str, worker: Optional[str],
         if m_cpu <= 0:
             m_cpu = m
         validate_shape(m_cpu, k, rank)
-    client = StratumPoolClient(pool_url, address, worker, difficulty, password, log=log)
+    client = StratumPoolClient(
+        pool_url, address, worker, difficulty, password,
+        agent=f"pearl-apple-miner/{__version__}", log=log,
+    )
     log(f"connecting to {client.host}:{client.port} (tls={client.use_tls}) as {address}"
         + (f".{worker}" if worker else ""))
     client.connect()
@@ -873,10 +876,10 @@ def main():
     ap.add_argument("--num-blocks", type=int, default=0, dest="num_blocks",
                     help="solo mode: stop after mining N blocks (0=run forever).")
     ap.add_argument("-w", "--worker", default=None,
-                    help="worker name reported to the pool, appended to your address as address.worker (default: none).")
+                    help="worker name reported to the pool (default: none).")
     ap.add_argument("--difficulty", type=int, default=None,
-                    help="pool mode: request fixed share difficulty; sends both the numeric field and "
-                         "password x;d=N for pool compatibility (default: pool-chosen).")
+                    help="pool mode: request fixed share difficulty through Stratum pass x;d=N "
+                         "(default: pool-chosen).")
     ap.add_argument("--password", default=None,
                     help="pool password/options, e.g. x;d=4096 or x;d=4096;t=25. "
                          "Overrides the password synthesized by --difficulty.")
