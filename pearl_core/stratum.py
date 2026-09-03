@@ -4,16 +4,17 @@ Lets the controller mine **to a pool** (share-based) instead of **solo** via
 pearld `getblocktemplate`/`submitblock`. The wire format was determined from
 live pool traffic and is documented below.
 
-Two pool dialects exist; this client implements the fully-captured one:
+Two pool endpoints use this wire format:
 
-  * **LuckyPool** (`mining.*`, object params) — IMPLEMENTED.
+  * **LuckyPool** (`mining.*`, object params).
       authorize : ``mining.authorize {"wallet": "prl1p….worker"}``  -> ``{result:true}``
       job       : server pushes ``mining.notify {header, height, job_id, target}``
       share     : ``mining.submit {"job_id", "plain_proof"}``  (base64 PlainProof)
-  * **AlphaPool** (`pearl.*`) — front-loads an anti-DDoS ``pearl.challenge`` PoW
-      gate before sending any work. We DETECT it and raise
-      `AlphaPoolChallengeUnsupported` (the challenge solver + post-auth frames
-      are not implemented in this release).
+  * **AlphaPool plain Stratum** (port 5571) uses the same object-param messages.
+      Its fixed difficulty is selected with authorize password ``x;d=N``.
+
+AlphaPool's legacy port 5566 front-loads an anti-DDoS ``pearl.challenge`` PoW
+gate. We detect that older dialect and raise `AlphaPoolChallengeUnsupported`.
 
 Key fact that shapes this client: a **share is a cheap `PlainProof`** (the
 Merkle openings of the winning A/B columns), NOT a Plonky2 proof. The POOL runs
@@ -120,27 +121,39 @@ class StratumPoolClient:
         wallet: str,
         worker: Optional[str] = None,
         difficulty: Optional[int] = None,
+        password: Optional[str] = None,
         log: Callable[[str], None] = print,
         timeout: float = 30.0,
+        keepalive_interval: float = 20.0,
     ):
         self.host, self.port, self.use_tls = parse_pool_url(url)
         self.wallet = wallet
         self.worker = worker
         self.difficulty = difficulty
+        # AlphaPool 5571 reads static difficulty from the standard password field;
+        # LuckyPool reads the numeric difficulty field. Sending both makes
+        # --difficulty portable while an explicit password can also carry t=<PRL>.
+        self.password = password if password is not None else (
+            f"x;d={int(difficulty)}" if difficulty is not None else None
+        )
         self.log = log
         self.timeout = timeout
+        self.keepalive_interval = max(0.0, float(keepalive_interval))
 
         self._sock: Optional[socket.socket] = None
         self._reader: Optional[threading.Thread] = None
         self._send_lock = threading.Lock()
         self._ids = itertools.count(1)
         self._pending: dict[int, tuple[threading.Event, list]] = {}
+        self._ignored_ids: set[int] = set()
         self._job: Optional[Job] = None
         self._job_lock = threading.Lock()
         self._job_event = threading.Event()
         self._challenge_event = threading.Event()
         self._closed = False
         self._authorized = False
+        self._last_send = 0.0
+        self._keepalive_thread: Optional[threading.Thread] = None
 
     # --- login string -------------------------------------------------------
     def _login(self) -> str:
@@ -148,6 +161,7 @@ class StratumPoolClient:
 
     # --- connection ---------------------------------------------------------
     def connect(self) -> None:
+        self._closed = False
         raw = socket.create_connection((self.host, self.port), timeout=self.timeout)
         if self.use_tls:
             ctx = ssl.create_default_context()
@@ -179,6 +193,7 @@ class StratumPoolClient:
                 raise StratumError("not connected")
             try:
                 self._sock.sendall(line)
+                self._last_send = time.monotonic()
             except OSError as e:
                 # Surface a dead socket as StratumError so callers like
                 # submit_share (which only catches StratumError) don't crash on it.
@@ -222,6 +237,8 @@ class StratumPoolClient:
             ev, holder = self._pending.pop(msg["id"])
             holder.append(msg)
             ev.set()
+        elif method is None and msg.get("id") in self._ignored_ids:
+            self._ignored_ids.discard(msg["id"])
         else:
             self.log(f"stratum: unhandled frame {line!r}")
 
@@ -265,9 +282,46 @@ class StratumPoolClient:
         params: dict = {"wallet": self._login()}
         if self.difficulty is not None:
             params["difficulty"] = int(self.difficulty)
+        if self.password is not None:
+            params["password"] = self.password
         result = self._request("mining.authorize", params, timeout=min(self.timeout, 12.0))
         self._authorized = True
+        if self.keepalive_interval and not (
+            self._keepalive_thread and self._keepalive_thread.is_alive()
+        ):
+            self._keepalive_thread = threading.Thread(
+                target=self._keepalive_loop, name="stratum-keepalive", daemon=True
+            )
+            self._keepalive_thread.start()
         return result
+
+    def keepalive_if_idle(self) -> None:
+        """Keep send-idle Stratum sessions alive while a low-rate share is searched.
+
+        Both observed public pools close an otherwise healthy socket after roughly
+        30–45 seconds without a client frame. ``mining.configure`` is harmless on the
+        Pearl gateways and is also what AlphaPool's legacy client uses as its ping.
+        """
+        if (
+            self._closed
+            or not self._authorized
+            or not self.keepalive_interval
+            or time.monotonic() - self._last_send < self.keepalive_interval
+        ):
+            return
+        rid = next(self._ids)
+        if len(self._ignored_ids) >= 64:
+            self._ignored_ids.clear()
+        self._ignored_ids.add(rid)
+        try:
+            self._send({"id": rid, "method": "mining.configure", "params": [["pearl/v1"], {}]})
+        except StratumError:
+            self._ignored_ids.discard(rid)
+
+    def _keepalive_loop(self) -> None:
+        while not self._closed:
+            time.sleep(min(5.0, self.keepalive_interval))
+            self.keepalive_if_idle()
 
     def submit_share(self, job_id: str, plain_proof_b64: str) -> tuple[bool, Any]:
         """Submit ``mining.submit {job_id, plain_proof}``. Returns (ok, result-or-error)."""
@@ -348,12 +402,17 @@ def snapshot_from_pool_job(job: Job, k: int, rank: int, rows, cols, generation: 
 
 
 def build_plain_proof_base64(winner, m: int, n: int, k: int, rank: int,
-                             log: Callable[[str], None] = print) -> tuple[Optional[str], Optional[str]]:
+                             log: Callable[[str], None] = print,
+                             verify_header_target: bool = True) -> tuple[Optional[str], Optional[str]]:
     """Build the share payload for a winning draw: the Merkle openings of the
     winning A/B rows/cols, packaged as a `PlainProof`, base64-encoded.
 
     This is the cheap half of `streaming.build_and_submit` (steps up to
     `verify_plain_proof`) — it does NOT run `generate_proof`; the pool proves.
+    ``verify_header_target`` is used by solo/self-test paths. Pool jobs deliberately
+    set it false: the header contains network block difficulty, while
+    ``reconstruct_winner`` has already checked the candidate against the easier pool
+    share target. Rechecking a normal share against the block target would discard it.
     Returns ``(base64, None)`` on success or ``(None, error_message)``.
     """
     import pearl_mining as rust
@@ -377,7 +436,8 @@ def build_plain_proof_base64(winner, m: int, n: int, k: int, rank: int,
     proof_b = rust.MatrixMerkleProof(tree_b.get_multileaf_proof(leaves_b), winner.b_cols)
 
     plain_proof = rust.PlainProof(m, n, k, rank, proof_a, proof_b)
-    ok, msg = rust.verify_plain_proof(rs_header, plain_proof)
-    if not ok:
-        return None, f"verify_plain_proof rejected: {msg}"
+    if verify_header_target:
+        ok, msg = rust.verify_plain_proof(rs_header, plain_proof)
+        if not ok:
+            return None, f"verify_plain_proof rejected: {msg}"
     return plain_proof.to_base64(), None

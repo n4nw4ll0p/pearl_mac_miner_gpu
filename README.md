@@ -23,11 +23,14 @@ python -m pip install -r requirements.txt
 ## Pool mining
 
 ```bash
-python miner.py --pool pearl-eu1.luckypool.io:3360 \
+python miner.py --pool us2.alphapool.tech:5571 --difficulty 4096 \
   --address <your-prl-address> --worker mymac
 ```
 
-Repeat `--pool URL` to configure failover pools.
+AlphaPool's port 5571 is plain Stratum and needs no shim. `--difficulty 4096`
+pins a low static difficulty for steady shares. Use `--password
+"x;d=4096;t=25"` to also set a 25 PRL payout threshold. LuckyPool remains
+available at `pearl-eu1.luckypool.io:3360`; repeat `--pool URL` for failover.
 
 ## Solo mining
 

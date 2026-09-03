@@ -35,6 +35,23 @@ class CliDefaultTests(unittest.TestCase):
         run_pool = self.run_cli(has_sme=False)
         self.assertEqual(run_pool.call_args.kwargs["engine"], "gpu")
 
+    def test_pool_password_is_forwarded(self):
+        run_pool = mock.Mock()
+        argv = [
+            "miner.py", "--pool", "us1.alphapool.tech:5571",
+            "--address", "prl1ptest", "--difficulty", "20000",
+            "--password", "x;d=20000;t=25", "--max-draws", "1",
+        ]
+        with (
+            mock.patch.object(sys, "argv", argv),
+            mock.patch.object(miner, "_has_sme", return_value=True),
+            mock.patch.object(miner, "run_pool", run_pool),
+            mock.patch.object(miner, "_make_logger", return_value=mock.Mock()),
+        ):
+            miner.main()
+        self.assertEqual(run_pool.call_args.kwargs["difficulty"], 20000)
+        self.assertEqual(run_pool.call_args.kwargs["password"], "x;d=20000;t=25")
+
 
 if __name__ == "__main__":
     unittest.main()

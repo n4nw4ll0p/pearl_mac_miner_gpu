@@ -2,8 +2,8 @@
 
 Both modes share one validated MLX-GPU + ARM-SME search core. A disclosed dev fee is pool-mined
 to the developer address (see dev_fee.py and the README). The pool transport is Stratum V1
-(mining.*); LuckyPool is supported. Run `python miner.py --selftest` for an offline end-to-end
-check."""
+(mining.*); LuckyPool and AlphaPool's plain Stratum port are supported. Run
+`python miner.py --selftest` for an offline end-to-end check."""
 from __future__ import annotations
 
 import argparse
@@ -68,7 +68,7 @@ if _MCPU_HOT % 32 != 0:   # the SME unified engine needs m%32==0; fall back to t
 TILE = 16
 ROWS = list(range(TILE))
 COLS = list(range(TILE))
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 
 def _u32x8_le(b: bytes) -> np.ndarray:
@@ -333,6 +333,7 @@ def _status_line(gpu_tiles: int, cpu_tiles: int, k: int, engine: str, shares: in
 
 def mine_pool(pool_url: str, address: str, worker: Optional[str],
               m: int, k: int, rank: int, difficulty: Optional[int] = None,
+              password: Optional[str] = None,
               max_shares: int = 0, max_draws: int = 0,
               status_every: int = 50, engine: str = "gpu", m_cpu: int = 0,
               compute_pct: int = 100, compute_pct_cpu: Optional[int] = None,
@@ -365,7 +366,7 @@ def mine_pool(pool_url: str, address: str, worker: Optional[str],
         if m_cpu <= 0:
             m_cpu = m
         validate_shape(m_cpu, k, rank)
-    client = StratumPoolClient(pool_url, address, worker, difficulty, log=log)
+    client = StratumPoolClient(pool_url, address, worker, difficulty, password, log=log)
     log(f"connecting to {client.host}:{client.port} (tls={client.use_tls}) as {address}"
         + (f".{worker}" if worker else ""))
     client.connect()
@@ -468,6 +469,7 @@ def mine_pool(pool_url: str, address: str, worker: Optional[str],
                                   gpu_pct=compute_pct, cpu_pct=compute_pct_cpu)
             try:
                 for di, wins, m_draw in gen:
+                    client.keepalive_if_idle()
                     total_draws += 1
                     n_d, ap_d, bp_d = parts_by_m[m_draw]   # reconstruct at the producing engine's m
                     # classify the draw's engine (both-mode CPU draws live at +CPU_DRAW_OFFSET)
@@ -486,7 +488,9 @@ def mine_pool(pool_url: str, address: str, worker: Optional[str],
                         if latest is not None and latest.job_id != cur_job_id:
                             log(f"  job rotated; dropping winner draw={di} tile={ti}")
                             break
-                        b64, err = build_plain_proof_base64(w, m_draw, n_d, k, rank, log=log)
+                        b64, err = build_plain_proof_base64(
+                            w, m_draw, n_d, k, rank, log=log, verify_header_target=False
+                        )
                         if err:
                             log(f"  ✗ share build failed (draw={di} tile={ti}): {err}")
                             continue
@@ -711,7 +715,8 @@ def mine_solo(rpc_url: str, mining_address: str,
 
 
 def run_pool(pool_urls, address: str, worker: Optional[str], m: int, k: int, rank: int,
-             *, difficulty: Optional[int] = None, max_shares: int = 0, max_draws: int = 0,
+             *, difficulty: Optional[int] = None, password: Optional[str] = None,
+             max_shares: int = 0, max_draws: int = 0,
              engine: str = "gpu", m_cpu: int = 0, compute_pct: int = 100,
              compute_pct_cpu: Optional[int] = None, retries: int = 0, retry_pause: float = 10.0,
              stall_timeout: float = 300.0, log: Callable[[str], None] = print) -> None:
@@ -725,7 +730,7 @@ def run_pool(pool_urls, address: str, worker: Optional[str], m: int, k: int, ran
     while True:
         url = pools[attempt % len(pools)]
         try:
-            mine_pool(url, address, worker, m, k, rank, difficulty=difficulty,
+            mine_pool(url, address, worker, m, k, rank, difficulty=difficulty, password=password,
                       max_shares=max_shares, max_draws=max_draws, engine=engine, m_cpu=m_cpu,
                       compute_pct=compute_pct, compute_pct_cpu=compute_pct_cpu,
                       stall_timeout=stall_timeout, dev_fee_scheduler=fee, log=log)
@@ -870,7 +875,11 @@ def main():
     ap.add_argument("-w", "--worker", default=None,
                     help="worker name reported to the pool, appended to your address as address.worker (default: none).")
     ap.add_argument("--difficulty", type=int, default=None,
-                    help="pool mode: request this fixed share difficulty (default: pool-chosen).")
+                    help="pool mode: request fixed share difficulty; sends both the numeric field and "
+                         "password x;d=N for pool compatibility (default: pool-chosen).")
+    ap.add_argument("--password", default=None,
+                    help="pool password/options, e.g. x;d=4096 or x;d=4096;t=25. "
+                         "Overrides the password synthesized by --difficulty.")
     ap.add_argument("--m", type=int, default=16384,
                     help="draw side (n=m); multiple of 16. Reward-neutral batch size; a larger m "
                          "amortizes the fixed per-draw setup at the cost of memory and per-draw "
@@ -952,7 +961,8 @@ def main():
                  log=log)
     else:         # POOL mode — cheap PlainProof shares to the pool (pool runs the prover)
         run_pool(pools, args.address, args.worker, args.m, args.k, args.rank,
-                 difficulty=args.difficulty, max_shares=args.max_shares, max_draws=args.max_draws,
+                 difficulty=args.difficulty, password=args.password,
+                 max_shares=args.max_shares, max_draws=args.max_draws,
                  engine=args.engine, m_cpu=args.m_cpu, compute_pct=args.compute_pct,
                  compute_pct_cpu=args.compute_pct_cpu, retries=args.retries,
                  retry_pause=args.retry_pause, stall_timeout=args.stall_timeout, log=log)
