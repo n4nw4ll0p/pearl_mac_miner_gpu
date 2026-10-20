@@ -18,8 +18,8 @@ from setup_kernels import signal_fused, build_ab_fused
 
 
 def search_draws_overlapped(base_seed: bytes, job_key: bytes, m: int, k: int,
-                            rank: int, bound_u32x8, draw_indices):
-    """Yield (draw_index, winning_tile_indices) for each index in `draw_indices`, overlapping the next draw's CPU commitment with the current draw's GPU search. Winners are identical to the non-overlapped path. bound_u32x8 is the difficulty target; m/k/rank the draw shape."""
+                            rank: int, bound_u32x8, draw_indices, cert_version: int = 0):
+    """Yield (draw_index, winning_tile_indices) for each index in `draw_indices`, overlapping the next draw's CPU commitment with the current draw's GPU search. Winners are identical to the non-overlapped path. bound_u32x8 is the difficulty target; m/k/rank the draw shape. cert_version >= 3 selects the V3 salted noise seeds."""
     bound = mx.array(bound_u32x8)
     idxs = list(draw_indices)
     if not idxs:
@@ -27,6 +27,7 @@ def search_draws_overlapped(base_seed: bytes, job_key: bytes, m: int, k: int,
 
     N = len(idxs)
     DEPTH = 2
+    dims = (m, m) if cert_version >= 3 else None
 
     def stage_S(n):
         Ag = signal_fused(base_seed, n, protocol.SIGNAL_LABEL_A, m, k)
@@ -38,7 +39,7 @@ def search_draws_overlapped(base_seed: bytes, job_key: bytes, m: int, k: int,
         A_view = np.frombuffer(memoryview(Ag), dtype=np.int8)
         a_pad = (A_view if A_view.nbytes % protocol.BLAKE3_CHUNK_LEN == 0
                  else protocol.pad_to_chunk_boundary(bytes(A_view)))
-        b_seed, a_seed = commitment_one_tree(job_key, a_pad)
+        b_seed, a_seed = commitment_one_tree(job_key, a_pad, dims=dims)
         e_ar = protocol.generate_permutation_matrix(protocol.SEED_LABEL_A, a_seed, k, rank)
         e_bl = protocol.generate_permutation_matrix(protocol.SEED_LABEL_B, b_seed, k, rank)
         return b_seed, a_seed, e_ar, e_bl

@@ -279,15 +279,39 @@ def compute_job_key(header: IncompleteBlockHeader, config: MiningConfiguration) 
     return blake3_digest(header.to_bytes() + config.to_bytes(), key=None)
 
 
+# --- V3 (salted noise-seed) certificate derivation ---------------------------
+# Consensus hardfork "salted noise-seed" (Aug 2026). Bind each Merkle root to its
+# declared dimension before the legacy commitment chain, so the noise seeds (and
+# therefore every derived matrix) differ from V1/V2.
+SEED_SALT_A = blake3_digest(b"pearl/cert-v3/noise-seed/A", key=None)
+SEED_SALT_B = blake3_digest(b"pearl/cert-v3/noise-seed/B", key=None)
+
+_BIND_PAD = b"\x00" * 28
+
+
+def _bind_root(root: bytes, dim: int, salt: bytes) -> bytes:
+    return blake3_digest(root + dim.to_bytes(4, "little") + _BIND_PAD, key=salt)
+
+
 def compute_commitment_hash(
-    job_key: bytes, a_row_major_padded: bytes, b_col_major_padded: bytes
+    job_key: bytes, a_row_major_padded: bytes, b_col_major_padded: bytes,
+    dims: Tuple[int, int] | None = None,
 ) -> Tuple[bytes, bytes]:
-    """Returns (b_noise_seed, a_noise_seed)."""
+    """Returns (b_noise_seed, a_noise_seed).
+
+    ``dims=(m, n)`` selects the V3 salted derivation (cert_version >= 3); ``None``
+    keeps the legacy V1/V2 chain used by offline/old-format jobs.
+    """
     hash_a = blake3_digest(a_row_major_padded, key=job_key)
     hash_b = blake3_digest(b_col_major_padded, key=job_key)
+    if dims is not None:
+        m, n = dims
+        hash_a = _bind_root(hash_a, m, SEED_SALT_A)
+        hash_b = _bind_root(hash_b, n, SEED_SALT_B)
     b_noise_seed = blake3_digest(job_key + hash_b, key=None)
     a_noise_seed = blake3_digest(b_noise_seed + hash_a, key=None)
     return b_noise_seed, a_noise_seed
+
 
 
 # --- Outer hash + target check ------------------------------------------------

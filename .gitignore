@@ -20,3 +20,6 @@ dist/
 
 # macOS metadata.
 .DS_Store
+
+# Mining runtime logs (keep out of the repo)
+logs/

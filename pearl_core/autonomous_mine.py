@@ -34,7 +34,8 @@ def reconstruct_winner(
     B_t = A
     a_pad = protocol.pad_to_chunk_boundary(A.tobytes())
     b_pad = protocol.pad_to_chunk_boundary(B_t.tobytes())
-    b_seed, a_seed = protocol.compute_commitment_hash(snap.job_key, a_pad, b_pad)
+    dims = (m, n) if getattr(snap, "cert_version", 0) >= 3 else None
+    b_seed, a_seed = protocol.compute_commitment_hash(snap.job_key, a_pad, b_pad, dims=dims)
     noise = protocol.compute_noise_for_indices(
         k, rank, (b_seed, a_seed), list(range(m)), list(range(n)),
     )

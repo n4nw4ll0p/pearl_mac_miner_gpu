@@ -134,7 +134,7 @@ def validate_shape(m: int, k: int, rank: int) -> None:
 
 
 def setup_symmetric(base_seed: bytes, draw_index: int, job_key: bytes,
-                    m: int, k: int, rank: int):
+                    m: int, k: int, rank: int, cert_version: int = 0):
     """Effective (a_eff, b_eff, a_seed_u32) for the symmetric draw (B = A, n = m).
 
     Mirrors `autonomous_mine.reconstruct_winner` exactly: cheap int7 A, one
@@ -143,7 +143,8 @@ def setup_symmetric(base_seed: bytes, draw_index: int, job_key: bytes,
     """
     A = protocol.signal_matrix_cheap(base_seed, draw_index, protocol.SIGNAL_LABEL_A, m, k)
     a_pad = protocol.pad_to_chunk_boundary(A.tobytes())
-    b_seed, a_seed = protocol.compute_commitment_hash(job_key, a_pad, a_pad)
+    dims = (m, m) if cert_version >= 3 else None
+    b_seed, a_seed = protocol.compute_commitment_hash(job_key, a_pad, a_pad, dims=dims)
     noise = protocol.compute_noise_for_indices(
         k, rank, (b_seed, a_seed), list(range(m)), list(range(m)))
     a_eff = A.astype(np.int32) + noise.a.astype(np.int32)
@@ -152,13 +153,15 @@ def setup_symmetric(base_seed: bytes, draw_index: int, job_key: bytes,
 
 
 def search_draw(base_seed: bytes, draw_index: int, job_key: bytes,
-                m: int, k: int, rank: int, bound_u32x8: np.ndarray) -> list[int]:
+                m: int, k: int, rank: int, bound_u32x8: np.ndarray,
+                cert_version: int = 0) -> list[int]:
     """Run one symmetric draw on the GPU; return winning tile indices (t=i*ntj+j).
 
     Setup also runs on the GPU (setup_symmetric_gpu): a_eff/b_eff are built on-device
     from small CPU-hashed inputs, avoiding the operand transfers. Bit-exact with the
     CPU setup."""
-    a_eff, b_eff, a_seed_u32 = setup_symmetric_gpu(base_seed, draw_index, job_key, m, k, rank)
+    a_eff, b_eff, a_seed_u32 = setup_symmetric_gpu(base_seed, draw_index, job_key, m, k, rank,
+                                                   cert_version=cert_version)
     mask, _, _ = search_mask(a_eff, b_eff, mx.array(a_seed_u32), mx.array(bound_u32x8), rank,
                              want_digest=False)  # digest discarded; skip its DRAM write
     return [int(t) for t in np.nonzero(np.array(mask))[0]]
@@ -198,7 +201,7 @@ def _throttled(make_chunk_gen, indices, pct: int, burst: int, should_stop=None):
 
 def _draw_generator(engine: str, base_seed: bytes, job_key: bytes, m: int, k: int,
                     rank: int, bound8: np.ndarray, start: int, batch: int, m_cpu: int = 0,
-                    gpu_pct: int = 100, cpu_pct: int = 100):
+                    gpu_pct: int = 100, cpu_pct: int = 100, cert_version: int = 0):
     """Yield (draw_index, winners, m_draw) for one batch from the selected engine(s). m_draw
     is the draw side that engine used (so the consumer reconstructs each winner at the right m).
       gpu  — the MLX GPU pipeline (search_draws_overlapped) at m
@@ -213,7 +216,8 @@ def _draw_generator(engine: str, base_seed: bytes, job_key: bytes, m: int, k: in
     idxs = range(start, start + batch)
     if engine == "gpu":
         def mk(chunk):
-            return search_draws_overlapped(base_seed, job_key, m, k, rank, bound8, chunk)
+            return search_draws_overlapped(base_seed, job_key, m, k, rank, bound8, chunk,
+                                           cert_version=cert_version)
         for di, wins in _throttled(mk, idxs, gpu_pct, THROTTLE_BURST):
             yield di, wins, m
     elif engine == "cpu":
@@ -223,16 +227,18 @@ def _draw_generator(engine: str, base_seed: bytes, job_key: bytes, m: int, k: in
 
         def mk(chunk):
             return search_draws_cpu(base_seed, job_key, m, k, rank, bound8, chunk,
-                                    n_tr=_cs.PL_ENGINE_THREADS_CPU)
+                                    n_tr=_cs.PL_ENGINE_THREADS_CPU, cert_version=cert_version)
         for di, wins in _throttled(mk, idxs, cpu_pct, THROTTLE_BURST_CPU):
             yield di, wins, m
     else:  # both — GPU at m, CPU/SME at m_cpu, disjoint nonce ranges, throttled independently
         yield from _merged_gpu_cpu(base_seed, job_key, m, m_cpu, k, rank, bound8, start, batch,
-                                   gpu_pct=gpu_pct, cpu_pct=cpu_pct)
+                                   gpu_pct=gpu_pct, cpu_pct=cpu_pct,
+                                   cert_version=cert_version)
 
 
 def _merged_gpu_cpu(base_seed: bytes, job_key: bytes, m_gpu: int, m_cpu: int, k: int, rank: int,
-                    bound8: np.ndarray, start: int, batch: int, gpu_pct: int = 100, cpu_pct: int = 100):
+                    bound8: np.ndarray, start: int, batch: int, gpu_pct: int = 100, cpu_pct: int = 100,
+                    cert_version: int = 0):
     """GPU (at m_gpu) and CPU+SME (at m_cpu) mine the same job simultaneously — independent
     engines on disjoint nonce ranges, each at its own optimal draw size — merged onto one stream
     as draws finish. Yields (draw_index, winners, m_draw) tagged with the producing engine's m.
@@ -244,10 +250,12 @@ def _merged_gpu_cpu(base_seed: bytes, job_key: bytes, m_gpu: int, m_cpu: int, k:
     stop = threading.Event()
 
     def mk_g(chunk):
-        return search_draws_overlapped(base_seed, job_key, m_gpu, k, rank, bound8, chunk)
+        return search_draws_overlapped(base_seed, job_key, m_gpu, k, rank, bound8, chunk,
+                                       cert_version=cert_version)
 
     def mk_c(chunk):
-        return search_draws_cpu(base_seed, job_key, m_cpu, k, rank, bound8, chunk)
+        return search_draws_cpu(base_seed, job_key, m_cpu, k, rank, bound8, chunk,
+                                cert_version=cert_version)
     ggen = _throttled(mk_g, range(start, start + batch), gpu_pct, THROTTLE_BURST,
                       should_stop=stop.is_set)
     cgen = _throttled(mk_c, range(start + CPU_DRAW_OFFSET, start + CPU_DRAW_OFFSET + batch),
@@ -451,6 +459,7 @@ def mine_pool(pool_url: str, address: str, worker: Optional[str],
                 log(f"job {job.job_id} height={job.height} "
                     f"raw_target~2^{job.target.bit_length() - 1} "
                     f"=> bound~2^{snap.bound.bit_length() - 1} "
+                    f"cert=v{snap.cert_version} "
                     f"tiles/draw={len(a_parts) * len(b_parts)}")
 
             # Stream draws for this job: draw N+1's CPU commitment overlaps draw N's
@@ -469,7 +478,8 @@ def mine_pool(pool_url: str, address: str, worker: Optional[str],
                     cur_m_cpu = new_m_cpu
             gen = _draw_generator(engine, base_seed, snap.job_key, m, k, rank, bound8,
                                   batch_start, STREAM_BATCH, m_cpu=cur_m_cpu,
-                                  gpu_pct=compute_pct, cpu_pct=compute_pct_cpu)
+                                  gpu_pct=compute_pct, cpu_pct=compute_pct_cpu,
+                                  cert_version=snap.cert_version)
             try:
                 for di, wins, m_draw in gen:
                     client.keepalive_if_idle()
@@ -654,7 +664,8 @@ def mine_solo(rpc_url: str, mining_address: str,
                     cur_m_cpu = new_m_cpu
             gen = _draw_generator(engine, base_seed, snap.job_key, m, k, rank, bound8,
                                   batch_start, STREAM_BATCH, m_cpu=cur_m_cpu,
-                                  gpu_pct=compute_pct, cpu_pct=compute_pct_cpu)
+                                  gpu_pct=compute_pct, cpu_pct=compute_pct_cpu,
+                                  cert_version=snap.cert_version)
             try:
                 for di, wins, m_draw in gen:
                     total_draws += 1
@@ -789,7 +800,7 @@ def _fake_job(target: int, m: int, k: int, rank: int) -> Job:
         nbits=0x207FFFFF,  # regtest-easy network bits (verifier target is generous)
     )
     return Job(job_id="selftest_262144", header_bytes=hdr.to_bytes(),
-               target=target, height=1, raw={})
+               target=target, height=1, raw={}, cert_version=1)
 
 
 def _selftest():

@@ -31,13 +31,20 @@ def _u32x8_le(b: bytes) -> np.ndarray:
     return np.frombuffer(b, dtype="<u4").copy()
 
 
-def commitment_one_tree(job_key: bytes, a_pad: bytes, commit_threads=None):
+def commitment_one_tree(job_key: bytes, a_pad: bytes, commit_threads=None, dims=None):
     from blake3 import blake3
     mt = _COMMIT_THREADS if commit_threads is None else commit_threads
     h = blake3(a_pad, key=job_key, max_threads=mt).digest()
-    b_noise_seed = protocol.blake3_digest(job_key + h, key=None)
-    a_noise_seed = protocol.blake3_digest(b_noise_seed + h, key=None)
+    if dims is not None:
+        m, n = dims
+        hash_a = protocol._bind_root(h, m, protocol.SEED_SALT_A)
+        hash_b = protocol._bind_root(h, n, protocol.SEED_SALT_B)
+    else:
+        hash_a = hash_b = h
+    b_noise_seed = protocol.blake3_digest(job_key + hash_b, key=None)
+    a_noise_seed = protocol.blake3_digest(b_noise_seed + hash_a, key=None)
     return b_noise_seed, a_noise_seed
+
 
 
 def signal_gpu(base_seed: bytes, draw_index: int, label: int, rows: int, cols: int):
@@ -109,12 +116,13 @@ def uniform_random_gpu_dual(label_a: bytes, label_b: bytes, key_a: bytes, key_b:
 
 
 def setup_symmetric_gpu(base_seed: bytes, draw_index: int, job_key: bytes,
-                        m: int, k: int, rank: int):
+                        m: int, k: int, rank: int, cert_version: int = 0):
     """Build one draw's operands on the GPU from (base_seed, draw_index, job_key) at shape (m, k, rank): returns (a_eff, b_eff, a_seed) bit-exact with the CPU setup. a_seed is the commitment key the search hashes with."""
     Ag = signal_gpu(base_seed, draw_index, protocol.SIGNAL_LABEL_A, m, k)
     A_i8 = np.array(Ag.astype(mx.int8))
     a_pad = protocol.pad_to_chunk_boundary(A_i8.tobytes())
-    b_seed, a_seed = commitment_one_tree(job_key, a_pad)
+    dims = (m, m) if cert_version >= 3 else None
+    b_seed, a_seed = commitment_one_tree(job_key, a_pad, dims=dims)
 
     e_al = uniform_random_gpu(protocol.SEED_LABEL_A, a_seed, m, rank)
     e_br = uniform_random_gpu(protocol.SEED_LABEL_B, b_seed, m, rank)

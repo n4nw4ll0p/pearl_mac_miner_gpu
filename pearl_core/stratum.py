@@ -98,6 +98,7 @@ class Job:
     target: int          # U256 share bound; jackpot hash must be <= this
     height: Optional[int]
     raw: dict = field(default_factory=dict)
+    cert_version: int = 0
 
     @classmethod
     def from_notify(cls, params: dict) -> "Job":
@@ -107,6 +108,7 @@ class Job:
             target=int(params["target"], 16),
             height=params.get("height"),
             raw=params,
+            cert_version=int(params.get("cert_version", 0) or 0),
         )
 
 
@@ -405,6 +407,7 @@ def snapshot_from_pool_job(job: Job, k: int, rank: int, rows, cols, generation: 
         raw_txns=[],
         bound=apply_difficulty_factor(job.target, py_config),
         job_key=compute_job_key(header, py_config),
+        cert_version=job.cert_version,
     )
 
 

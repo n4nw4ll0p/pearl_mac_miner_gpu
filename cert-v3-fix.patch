@@ -1,0 +1,388 @@
+diff --git a/cpu_search.py b/cpu_search.py
+index fc03dd5..4dc6367 100644
+--- a/cpu_search.py
++++ b/cpu_search.py
+@@ -287,13 +287,15 @@ def winners(tr: np.ndarray, a_seed_u32: np.ndarray, bound_u32x8: np.ndarray,
+ 
+ 
+ def setup_packed(base_seed: bytes, draw_index: int, job_key: bytes,
+-                 m: int, k: int, rank: int, threads: int = SME_THREADS, pool=None):
++                 m: int, k: int, rank: int, threads: int = SME_THREADS, pool=None,
++                 cert_version: int = 0):
+     from pearl_core import protocol
+     from fast_setup import commitment_one_tree
+     A = cpu_signal(base_seed, draw_index, protocol.SIGNAL_LABEL_A, m, k, threads, pool)
+     a_buf = A if (A.size % protocol.BLAKE3_CHUNK_LEN == 0) else \
+         np.frombuffer(protocol.pad_to_chunk_boundary(A.tobytes()), np.int8)
+-    b_seed, a_seed = commitment_one_tree(job_key, a_buf)
++    dims = (m, m) if cert_version >= 3 else None
++    b_seed, a_seed = commitment_one_tree(job_key, a_buf, dims=dims)
+     e_ar = protocol.generate_permutation_matrix(protocol.SEED_LABEL_A, a_seed, k, rank)
+     e_bl = protocol.generate_permutation_matrix(protocol.SEED_LABEL_B, b_seed, k, rank)
+     Ap, Bp = cpu_build_both_f(A, a_seed, b_seed, e_ar, e_bl, m, k, rank, threads, pool)
+@@ -301,21 +303,24 @@ def setup_packed(base_seed: bytes, draw_index: int, job_key: bytes,
+ 
+ 
+ def search_draw_cpu(base_seed: bytes, draw_index: int, job_key: bytes,
+-                    m: int, k: int, rank: int, bound_u32x8: np.ndarray) -> list[int]:
+-    Ap, Bp, a_seed_u32 = setup_packed(base_seed, draw_index, job_key, m, k, rank)
++                    m: int, k: int, rank: int, bound_u32x8: np.ndarray,
++                    cert_version: int = 0) -> list[int]:
++    Ap, Bp, a_seed_u32 = setup_packed(base_seed, draw_index, job_key, m, k, rank,
++                                      cert_version=cert_version)
+     tr = transcripts(Ap, Bp, m // 16, k // 4, rank // 4)
+     return winners(tr, a_seed_u32, bound_u32x8)
+ 
+ 
+ def search_draws_cpu(base_seed: bytes, job_key: bytes, m: int, k: int, rank: int,
+-                     bound_u32x8, draw_indices):
++                     bound_u32x8, draw_indices, cert_version: int = 0):
+     idxs = list(draw_indices)
+     if not idxs:
+         return
+     bound = np.asarray(bound_u32x8, np.uint32)
+     def _setup(di):
+         return setup_packed(base_seed, di, job_key, m, k, rank,
+-                            threads=SETUP_THREADS, pool=_SETUP_POOL)
++                            threads=SETUP_THREADS, pool=_SETUP_POOL,
++                            cert_version=cert_version)
+ 
+     fut = _PREFETCH.submit(_setup, idxs[0])
+     for i, di in enumerate(idxs):
+@@ -372,8 +377,12 @@ def search_draws_cpu_unified(base_seed: bytes, job_key: bytes, m: int, k: int, r
+ 
+ 
+ def search_draws_cpu_auto(base_seed: bytes, job_key: bytes, m: int, k: int, rank: int,
+-                          bound_u32x8, draw_indices, n_tr=None):
+-    """CPU + ARM-SME search for `draw_indices`, yielding (draw_index, winning_tile_indices); bit-exact with the GPU search. m/k/rank: draw shape; bound_u32x8: difficulty target. Selects the fastest available CPU engine."""
++                          bound_u32x8, draw_indices, n_tr=None, cert_version: int = 0):
++    """CPU + ARM-SME search for `draw_indices`, yielding (draw_index, winning_tile_indices); bit-exact with the GPU search. m/k/rank: draw shape; bound_u32x8: difficulty target. Selects the fastest available CPU engine. cert_version >= 3 uses the V3 salted Python path (the native engine only implements the legacy derivation)."""
++    if cert_version >= 3:
++        yield from search_draws_cpu(base_seed, job_key, m, k, rank, bound_u32x8,
++                                    draw_indices, cert_version=cert_version)
++        return
+     yield from search_draws_cpu_unified(base_seed, job_key, m, k, rank, bound_u32x8,
+                                         draw_indices, n_tr=n_tr)
+ 
+diff --git a/fast_setup.py b/fast_setup.py
+index 183b2b8..39ed4bf 100644
+--- a/fast_setup.py
++++ b/fast_setup.py
+@@ -31,15 +31,22 @@ def _u32x8_le(b: bytes) -> np.ndarray:
+     return np.frombuffer(b, dtype="<u4").copy()
+ 
+ 
+-def commitment_one_tree(job_key: bytes, a_pad: bytes, commit_threads=None):
++def commitment_one_tree(job_key: bytes, a_pad: bytes, commit_threads=None, dims=None):
+     from blake3 import blake3
+     mt = _COMMIT_THREADS if commit_threads is None else commit_threads
+     h = blake3(a_pad, key=job_key, max_threads=mt).digest()
+-    b_noise_seed = protocol.blake3_digest(job_key + h, key=None)
+-    a_noise_seed = protocol.blake3_digest(b_noise_seed + h, key=None)
++    if dims is not None:
++        m, n = dims
++        hash_a = protocol._bind_root(h, m, protocol.SEED_SALT_A)
++        hash_b = protocol._bind_root(h, n, protocol.SEED_SALT_B)
++    else:
++        hash_a = hash_b = h
++    b_noise_seed = protocol.blake3_digest(job_key + hash_b, key=None)
++    a_noise_seed = protocol.blake3_digest(b_noise_seed + hash_a, key=None)
+     return b_noise_seed, a_noise_seed
+ 
+ 
++
+ def signal_gpu(base_seed: bytes, draw_index: int, label: int, rows: int, cols: int):
+     if len(base_seed) != 32:
+         raise ValueError(f"base_seed must be 32 bytes, got {len(base_seed)}")
+@@ -109,12 +116,13 @@ def uniform_random_gpu_dual(label_a: bytes, label_b: bytes, key_a: bytes, key_b:
+ 
+ 
+ def setup_symmetric_gpu(base_seed: bytes, draw_index: int, job_key: bytes,
+-                        m: int, k: int, rank: int):
++                        m: int, k: int, rank: int, cert_version: int = 0):
+     """Build one draw's operands on the GPU from (base_seed, draw_index, job_key) at shape (m, k, rank): returns (a_eff, b_eff, a_seed) bit-exact with the CPU setup. a_seed is the commitment key the search hashes with."""
+     Ag = signal_gpu(base_seed, draw_index, protocol.SIGNAL_LABEL_A, m, k)
+     A_i8 = np.array(Ag.astype(mx.int8))
+     a_pad = protocol.pad_to_chunk_boundary(A_i8.tobytes())
+-    b_seed, a_seed = commitment_one_tree(job_key, a_pad)
++    dims = (m, m) if cert_version >= 3 else None
++    b_seed, a_seed = commitment_one_tree(job_key, a_pad, dims=dims)
+ 
+     e_al = uniform_random_gpu(protocol.SEED_LABEL_A, a_seed, m, rank)
+     e_br = uniform_random_gpu(protocol.SEED_LABEL_B, b_seed, m, rank)
+diff --git a/miner.py b/miner.py
+index ce6c72b..4d114b7 100644
+--- a/miner.py
++++ b/miner.py
+@@ -134,7 +134,7 @@ def validate_shape(m: int, k: int, rank: int) -> None:
+ 
+ 
+ def setup_symmetric(base_seed: bytes, draw_index: int, job_key: bytes,
+-                    m: int, k: int, rank: int):
++                    m: int, k: int, rank: int, cert_version: int = 0):
+     """Effective (a_eff, b_eff, a_seed_u32) for the symmetric draw (B = A, n = m).
+ 
+     Mirrors `autonomous_mine.reconstruct_winner` exactly: cheap int7 A, one
+@@ -143,7 +143,8 @@ def setup_symmetric(base_seed: bytes, draw_index: int, job_key: bytes,
+     """
+     A = protocol.signal_matrix_cheap(base_seed, draw_index, protocol.SIGNAL_LABEL_A, m, k)
+     a_pad = protocol.pad_to_chunk_boundary(A.tobytes())
+-    b_seed, a_seed = protocol.compute_commitment_hash(job_key, a_pad, a_pad)
++    dims = (m, m) if cert_version >= 3 else None
++    b_seed, a_seed = protocol.compute_commitment_hash(job_key, a_pad, a_pad, dims=dims)
+     noise = protocol.compute_noise_for_indices(
+         k, rank, (b_seed, a_seed), list(range(m)), list(range(m)))
+     a_eff = A.astype(np.int32) + noise.a.astype(np.int32)
+@@ -152,13 +153,15 @@ def setup_symmetric(base_seed: bytes, draw_index: int, job_key: bytes,
+ 
+ 
+ def search_draw(base_seed: bytes, draw_index: int, job_key: bytes,
+-                m: int, k: int, rank: int, bound_u32x8: np.ndarray) -> list[int]:
++                m: int, k: int, rank: int, bound_u32x8: np.ndarray,
++                cert_version: int = 0) -> list[int]:
+     """Run one symmetric draw on the GPU; return winning tile indices (t=i*ntj+j).
+ 
+     Setup also runs on the GPU (setup_symmetric_gpu): a_eff/b_eff are built on-device
+     from small CPU-hashed inputs, avoiding the operand transfers. Bit-exact with the
+     CPU setup."""
+-    a_eff, b_eff, a_seed_u32 = setup_symmetric_gpu(base_seed, draw_index, job_key, m, k, rank)
++    a_eff, b_eff, a_seed_u32 = setup_symmetric_gpu(base_seed, draw_index, job_key, m, k, rank,
++                                                   cert_version=cert_version)
+     mask, _, _ = search_mask(a_eff, b_eff, mx.array(a_seed_u32), mx.array(bound_u32x8), rank,
+                              want_digest=False)  # digest discarded; skip its DRAM write
+     return [int(t) for t in np.nonzero(np.array(mask))[0]]
+@@ -198,7 +201,7 @@ def _throttled(make_chunk_gen, indices, pct: int, burst: int, should_stop=None):
+ 
+ def _draw_generator(engine: str, base_seed: bytes, job_key: bytes, m: int, k: int,
+                     rank: int, bound8: np.ndarray, start: int, batch: int, m_cpu: int = 0,
+-                    gpu_pct: int = 100, cpu_pct: int = 100):
++                    gpu_pct: int = 100, cpu_pct: int = 100, cert_version: int = 0):
+     """Yield (draw_index, winners, m_draw) for one batch from the selected engine(s). m_draw
+     is the draw side that engine used (so the consumer reconstructs each winner at the right m).
+       gpu  — the MLX GPU pipeline (search_draws_overlapped) at m
+@@ -213,7 +216,8 @@ def _draw_generator(engine: str, base_seed: bytes, job_key: bytes, m: int, k: in
+     idxs = range(start, start + batch)
+     if engine == "gpu":
+         def mk(chunk):
+-            return search_draws_overlapped(base_seed, job_key, m, k, rank, bound8, chunk)
++            return search_draws_overlapped(base_seed, job_key, m, k, rank, bound8, chunk,
++                                           cert_version=cert_version)
+         for di, wins in _throttled(mk, idxs, gpu_pct, THROTTLE_BURST):
+             yield di, wins, m
+     elif engine == "cpu":
+@@ -223,16 +227,18 @@ def _draw_generator(engine: str, base_seed: bytes, job_key: bytes, m: int, k: in
+ 
+         def mk(chunk):
+             return search_draws_cpu(base_seed, job_key, m, k, rank, bound8, chunk,
+-                                    n_tr=_cs.PL_ENGINE_THREADS_CPU)
++                                    n_tr=_cs.PL_ENGINE_THREADS_CPU, cert_version=cert_version)
+         for di, wins in _throttled(mk, idxs, cpu_pct, THROTTLE_BURST_CPU):
+             yield di, wins, m
+     else:  # both — GPU at m, CPU/SME at m_cpu, disjoint nonce ranges, throttled independently
+         yield from _merged_gpu_cpu(base_seed, job_key, m, m_cpu, k, rank, bound8, start, batch,
+-                                   gpu_pct=gpu_pct, cpu_pct=cpu_pct)
++                                   gpu_pct=gpu_pct, cpu_pct=cpu_pct,
++                                   cert_version=cert_version)
+ 
+ 
+ def _merged_gpu_cpu(base_seed: bytes, job_key: bytes, m_gpu: int, m_cpu: int, k: int, rank: int,
+-                    bound8: np.ndarray, start: int, batch: int, gpu_pct: int = 100, cpu_pct: int = 100):
++                    bound8: np.ndarray, start: int, batch: int, gpu_pct: int = 100, cpu_pct: int = 100,
++                    cert_version: int = 0):
+     """GPU (at m_gpu) and CPU+SME (at m_cpu) mine the same job simultaneously — independent
+     engines on disjoint nonce ranges, each at its own optimal draw size — merged onto one stream
+     as draws finish. Yields (draw_index, winners, m_draw) tagged with the producing engine's m.
+@@ -244,10 +250,12 @@ def _merged_gpu_cpu(base_seed: bytes, job_key: bytes, m_gpu: int, m_cpu: int, k:
+     stop = threading.Event()
+ 
+     def mk_g(chunk):
+-        return search_draws_overlapped(base_seed, job_key, m_gpu, k, rank, bound8, chunk)
++        return search_draws_overlapped(base_seed, job_key, m_gpu, k, rank, bound8, chunk,
++                                       cert_version=cert_version)
+ 
+     def mk_c(chunk):
+-        return search_draws_cpu(base_seed, job_key, m_cpu, k, rank, bound8, chunk)
++        return search_draws_cpu(base_seed, job_key, m_cpu, k, rank, bound8, chunk,
++                                cert_version=cert_version)
+     ggen = _throttled(mk_g, range(start, start + batch), gpu_pct, THROTTLE_BURST,
+                       should_stop=stop.is_set)
+     cgen = _throttled(mk_c, range(start + CPU_DRAW_OFFSET, start + CPU_DRAW_OFFSET + batch),
+@@ -451,6 +459,7 @@ def mine_pool(pool_url: str, address: str, worker: Optional[str],
+                 log(f"job {job.job_id} height={job.height} "
+                     f"raw_target~2^{job.target.bit_length() - 1} "
+                     f"=> bound~2^{snap.bound.bit_length() - 1} "
++                    f"cert=v{snap.cert_version} "
+                     f"tiles/draw={len(a_parts) * len(b_parts)}")
+ 
+             # Stream draws for this job: draw N+1's CPU commitment overlaps draw N's
+@@ -469,7 +478,8 @@ def mine_pool(pool_url: str, address: str, worker: Optional[str],
+                     cur_m_cpu = new_m_cpu
+             gen = _draw_generator(engine, base_seed, snap.job_key, m, k, rank, bound8,
+                                   batch_start, STREAM_BATCH, m_cpu=cur_m_cpu,
+-                                  gpu_pct=compute_pct, cpu_pct=compute_pct_cpu)
++                                  gpu_pct=compute_pct, cpu_pct=compute_pct_cpu,
++                                  cert_version=snap.cert_version)
+             try:
+                 for di, wins, m_draw in gen:
+                     client.keepalive_if_idle()
+@@ -654,7 +664,8 @@ def mine_solo(rpc_url: str, mining_address: str,
+                     cur_m_cpu = new_m_cpu
+             gen = _draw_generator(engine, base_seed, snap.job_key, m, k, rank, bound8,
+                                   batch_start, STREAM_BATCH, m_cpu=cur_m_cpu,
+-                                  gpu_pct=compute_pct, cpu_pct=compute_pct_cpu)
++                                  gpu_pct=compute_pct, cpu_pct=compute_pct_cpu,
++                                  cert_version=snap.cert_version)
+             try:
+                 for di, wins, m_draw in gen:
+                     total_draws += 1
+@@ -789,7 +800,7 @@ def _fake_job(target: int, m: int, k: int, rank: int) -> Job:
+         nbits=0x207FFFFF,  # regtest-easy network bits (verifier target is generous)
+     )
+     return Job(job_id="selftest_262144", header_bytes=hdr.to_bytes(),
+-               target=target, height=1, raw={})
++               target=target, height=1, raw={}, cert_version=1)
+ 
+ 
+ def _selftest():
+diff --git a/pearl_core/autonomous_mine.py b/pearl_core/autonomous_mine.py
+index a72c0f4..bf619e9 100644
+--- a/pearl_core/autonomous_mine.py
++++ b/pearl_core/autonomous_mine.py
+@@ -34,7 +34,8 @@ def reconstruct_winner(
+     B_t = A
+     a_pad = protocol.pad_to_chunk_boundary(A.tobytes())
+     b_pad = protocol.pad_to_chunk_boundary(B_t.tobytes())
+-    b_seed, a_seed = protocol.compute_commitment_hash(snap.job_key, a_pad, b_pad)
++    dims = (m, n) if getattr(snap, "cert_version", 0) >= 3 else None
++    b_seed, a_seed = protocol.compute_commitment_hash(snap.job_key, a_pad, b_pad, dims=dims)
+     noise = protocol.compute_noise_for_indices(
+         k, rank, (b_seed, a_seed), list(range(m)), list(range(n)),
+     )
+diff --git a/pearl_core/protocol.py b/pearl_core/protocol.py
+index 11361a9..a529f29 100644
+--- a/pearl_core/protocol.py
++++ b/pearl_core/protocol.py
+@@ -279,17 +279,41 @@ def compute_job_key(header: IncompleteBlockHeader, config: MiningConfiguration)
+     return blake3_digest(header.to_bytes() + config.to_bytes(), key=None)
+ 
+ 
++# --- V3 (salted noise-seed) certificate derivation ---------------------------
++# Consensus hardfork "salted noise-seed" (Aug 2026). Bind each Merkle root to its
++# declared dimension before the legacy commitment chain, so the noise seeds (and
++# therefore every derived matrix) differ from V1/V2.
++SEED_SALT_A = blake3_digest(b"pearl/cert-v3/noise-seed/A", key=None)
++SEED_SALT_B = blake3_digest(b"pearl/cert-v3/noise-seed/B", key=None)
++
++_BIND_PAD = b"\x00" * 28
++
++
++def _bind_root(root: bytes, dim: int, salt: bytes) -> bytes:
++    return blake3_digest(root + dim.to_bytes(4, "little") + _BIND_PAD, key=salt)
++
++
+ def compute_commitment_hash(
+-    job_key: bytes, a_row_major_padded: bytes, b_col_major_padded: bytes
++    job_key: bytes, a_row_major_padded: bytes, b_col_major_padded: bytes,
++    dims: Tuple[int, int] | None = None,
+ ) -> Tuple[bytes, bytes]:
+-    """Returns (b_noise_seed, a_noise_seed)."""
++    """Returns (b_noise_seed, a_noise_seed).
++
++    ``dims=(m, n)`` selects the V3 salted derivation (cert_version >= 3); ``None``
++    keeps the legacy V1/V2 chain used by offline/old-format jobs.
++    """
+     hash_a = blake3_digest(a_row_major_padded, key=job_key)
+     hash_b = blake3_digest(b_col_major_padded, key=job_key)
++    if dims is not None:
++        m, n = dims
++        hash_a = _bind_root(hash_a, m, SEED_SALT_A)
++        hash_b = _bind_root(hash_b, n, SEED_SALT_B)
+     b_noise_seed = blake3_digest(job_key + hash_b, key=None)
+     a_noise_seed = blake3_digest(b_noise_seed + hash_a, key=None)
+     return b_noise_seed, a_noise_seed
+ 
+ 
++
+ # --- Outer hash + target check ------------------------------------------------
+ 
+ 
+diff --git a/pearl_core/stratum.py b/pearl_core/stratum.py
+index 2b650fa..553bc4b 100644
+--- a/pearl_core/stratum.py
++++ b/pearl_core/stratum.py
+@@ -98,6 +98,7 @@ class Job:
+     target: int          # U256 share bound; jackpot hash must be <= this
+     height: Optional[int]
+     raw: dict = field(default_factory=dict)
++    cert_version: int = 0
+ 
+     @classmethod
+     def from_notify(cls, params: dict) -> "Job":
+@@ -107,6 +108,7 @@ class Job:
+             target=int(params["target"], 16),
+             height=params.get("height"),
+             raw=params,
++            cert_version=int(params.get("cert_version", 0) or 0),
+         )
+ 
+ 
+@@ -405,6 +407,7 @@ def snapshot_from_pool_job(job: Job, k: int, rank: int, rows, cols, generation:
+         raw_txns=[],
+         bound=apply_difficulty_factor(job.target, py_config),
+         job_key=compute_job_key(header, py_config),
++        cert_version=job.cert_version,
+     )
+ 
+ 
+diff --git a/pearl_core/streaming.py b/pearl_core/streaming.py
+index d58f258..292f095 100644
+--- a/pearl_core/streaming.py
++++ b/pearl_core/streaming.py
+@@ -47,6 +47,7 @@ class TemplateSnapshot:
+     raw_txns: list[bytes]
+     bound: int
+     job_key: bytes
++    cert_version: int = 0
+ 
+ 
+ @dataclass
+@@ -230,6 +231,7 @@ def snapshot_from_template(
+         coinbase_tx=coinbase_tx, raw_txns=raw_txns,
+         bound=extract_difficulty_bound(nbits, py_config),
+         job_key=compute_job_key(header, py_config),
++        cert_version=3,  # mainnet is on the salted noise-seed (V3) cert since Aug 2026
+     )
+ 
+ 
+diff --git a/stream_search.py b/stream_search.py
+index b1bf68b..ef1a54a 100644
+--- a/stream_search.py
++++ b/stream_search.py
+@@ -18,8 +18,8 @@ from setup_kernels import signal_fused, build_ab_fused
+ 
+ 
+ def search_draws_overlapped(base_seed: bytes, job_key: bytes, m: int, k: int,
+-                            rank: int, bound_u32x8, draw_indices):
+-    """Yield (draw_index, winning_tile_indices) for each index in `draw_indices`, overlapping the next draw's CPU commitment with the current draw's GPU search. Winners are identical to the non-overlapped path. bound_u32x8 is the difficulty target; m/k/rank the draw shape."""
++                            rank: int, bound_u32x8, draw_indices, cert_version: int = 0):
++    """Yield (draw_index, winning_tile_indices) for each index in `draw_indices`, overlapping the next draw's CPU commitment with the current draw's GPU search. Winners are identical to the non-overlapped path. bound_u32x8 is the difficulty target; m/k/rank the draw shape. cert_version >= 3 selects the V3 salted noise seeds."""
+     bound = mx.array(bound_u32x8)
+     idxs = list(draw_indices)
+     if not idxs:
+@@ -27,6 +27,7 @@ def search_draws_overlapped(base_seed: bytes, job_key: bytes, m: int, k: int,
+ 
+     N = len(idxs)
+     DEPTH = 2
++    dims = (m, m) if cert_version >= 3 else None
+ 
+     def stage_S(n):
+         Ag = signal_fused(base_seed, n, protocol.SIGNAL_LABEL_A, m, k)
+@@ -38,7 +39,7 @@ def search_draws_overlapped(base_seed: bytes, job_key: bytes, m: int, k: int,
+         A_view = np.frombuffer(memoryview(Ag), dtype=np.int8)
+         a_pad = (A_view if A_view.nbytes % protocol.BLAKE3_CHUNK_LEN == 0
+                  else protocol.pad_to_chunk_boundary(bytes(A_view)))
+-        b_seed, a_seed = commitment_one_tree(job_key, a_pad)
++        b_seed, a_seed = commitment_one_tree(job_key, a_pad, dims=dims)
+         e_ar = protocol.generate_permutation_matrix(protocol.SEED_LABEL_A, a_seed, k, rank)
+         e_bl = protocol.generate_permutation_matrix(protocol.SEED_LABEL_B, b_seed, k, rank)
+         return b_seed, a_seed, e_ar, e_bl

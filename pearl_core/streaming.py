@@ -47,6 +47,7 @@ class TemplateSnapshot:
     raw_txns: list[bytes]
     bound: int
     job_key: bytes
+    cert_version: int = 0
 
 
 @dataclass
@@ -230,6 +231,7 @@ def snapshot_from_template(
         coinbase_tx=coinbase_tx, raw_txns=raw_txns,
         bound=extract_difficulty_bound(nbits, py_config),
         job_key=compute_job_key(header, py_config),
+        cert_version=3,  # mainnet is on the salted noise-seed (V3) cert since Aug 2026
     )
 
 

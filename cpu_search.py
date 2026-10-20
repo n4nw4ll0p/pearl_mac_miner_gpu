@@ -287,13 +287,15 @@ def winners(tr: np.ndarray, a_seed_u32: np.ndarray, bound_u32x8: np.ndarray,
 
 
 def setup_packed(base_seed: bytes, draw_index: int, job_key: bytes,
-                 m: int, k: int, rank: int, threads: int = SME_THREADS, pool=None):
+                 m: int, k: int, rank: int, threads: int = SME_THREADS, pool=None,
+                 cert_version: int = 0):
     from pearl_core import protocol
     from fast_setup import commitment_one_tree
     A = cpu_signal(base_seed, draw_index, protocol.SIGNAL_LABEL_A, m, k, threads, pool)
     a_buf = A if (A.size % protocol.BLAKE3_CHUNK_LEN == 0) else \
         np.frombuffer(protocol.pad_to_chunk_boundary(A.tobytes()), np.int8)
-    b_seed, a_seed = commitment_one_tree(job_key, a_buf)
+    dims = (m, m) if cert_version >= 3 else None
+    b_seed, a_seed = commitment_one_tree(job_key, a_buf, dims=dims)
     e_ar = protocol.generate_permutation_matrix(protocol.SEED_LABEL_A, a_seed, k, rank)
     e_bl = protocol.generate_permutation_matrix(protocol.SEED_LABEL_B, b_seed, k, rank)
     Ap, Bp = cpu_build_both_f(A, a_seed, b_seed, e_ar, e_bl, m, k, rank, threads, pool)
@@ -301,21 +303,24 @@ def setup_packed(base_seed: bytes, draw_index: int, job_key: bytes,
 
 
 def search_draw_cpu(base_seed: bytes, draw_index: int, job_key: bytes,
-                    m: int, k: int, rank: int, bound_u32x8: np.ndarray) -> list[int]:
-    Ap, Bp, a_seed_u32 = setup_packed(base_seed, draw_index, job_key, m, k, rank)
+                    m: int, k: int, rank: int, bound_u32x8: np.ndarray,
+                    cert_version: int = 0) -> list[int]:
+    Ap, Bp, a_seed_u32 = setup_packed(base_seed, draw_index, job_key, m, k, rank,
+                                      cert_version=cert_version)
     tr = transcripts(Ap, Bp, m // 16, k // 4, rank // 4)
     return winners(tr, a_seed_u32, bound_u32x8)
 
 
 def search_draws_cpu(base_seed: bytes, job_key: bytes, m: int, k: int, rank: int,
-                     bound_u32x8, draw_indices):
+                     bound_u32x8, draw_indices, cert_version: int = 0):
     idxs = list(draw_indices)
     if not idxs:
         return
     bound = np.asarray(bound_u32x8, np.uint32)
     def _setup(di):
         return setup_packed(base_seed, di, job_key, m, k, rank,
-                            threads=SETUP_THREADS, pool=_SETUP_POOL)
+                            threads=SETUP_THREADS, pool=_SETUP_POOL,
+                            cert_version=cert_version)
 
     fut = _PREFETCH.submit(_setup, idxs[0])
     for i, di in enumerate(idxs):
@@ -372,8 +377,12 @@ def search_draws_cpu_unified(base_seed: bytes, job_key: bytes, m: int, k: int, r
 
 
 def search_draws_cpu_auto(base_seed: bytes, job_key: bytes, m: int, k: int, rank: int,
-                          bound_u32x8, draw_indices, n_tr=None):
-    """CPU + ARM-SME search for `draw_indices`, yielding (draw_index, winning_tile_indices); bit-exact with the GPU search. m/k/rank: draw shape; bound_u32x8: difficulty target. Selects the fastest available CPU engine."""
+                          bound_u32x8, draw_indices, n_tr=None, cert_version: int = 0):
+    """CPU + ARM-SME search for `draw_indices`, yielding (draw_index, winning_tile_indices); bit-exact with the GPU search. m/k/rank: draw shape; bound_u32x8: difficulty target. Selects the fastest available CPU engine. cert_version >= 3 uses the V3 salted Python path (the native engine only implements the legacy derivation)."""
+    if cert_version >= 3:
+        yield from search_draws_cpu(base_seed, job_key, m, k, rank, bound_u32x8,
+                                    draw_indices, cert_version=cert_version)
+        return
     yield from search_draws_cpu_unified(base_seed, job_key, m, k, rank, bound_u32x8,
                                         draw_indices, n_tr=n_tr)
 
